@@ -361,23 +361,9 @@ nav button.on span svg { stroke: var(--red); transform: translateY(-2px) scale(1
 <div class="modal" id="wm" onclick="if(event.target==this)wd(0)">
   <div class="sheet">
     <h3 style="font-size:24px;margin-bottom:8px">Вывод звёзд</h3>
-    <p style="color:var(--mut);font-size:13px;font-weight:600;margin-bottom:16px">Заявку проверит владелец и выплатит вручную. Укажите свой @username. Для подарка сначала нажмите Start у @MurdergameBot.</p>
-    <div class="chips" style="margin:0 0 12px"><button class="chip on" id="wm-s" onclick="wdMode(0)">Звёздами</button><button class="chip" id="wm-g" onclick="wdMode(1)">Подарком</button></div>
-    <div class="chips" id="wgifts" style="display:none;max-height:130px;overflow:auto;margin:0 0 12px"></div>
-    <input class="inp" id="wun" type="text" placeholder="@username" autocapitalize="off" style="font-size:18px;margin-bottom:12px">
+    <p style="color:var(--mut);font-size:13px;font-weight:600;margin-bottom:16px">Звёзды сразу придут на ваш аккаунт StaticGram. Лимит: 35 000 ★ в сутки.</p>
     <input class="inp" id="wam" type="number" placeholder="Сумма от 100 ★" style="margin-bottom:12px">
-    <button class="btn" id="wbtn" onclick="doWd()">Отправить заявку</button>
-  </div>
-</div>
-
-<div class="modal" id="tm" onclick="if(event.target==this)tk(0)">
-  <div class="sheet">
-    <h3 style="font-size:24px;margin-bottom:8px">Заявка на вывод</h3>
-    <div class="trow"><span>Юз:</span><b id="tk-u"></b></div>
-    <div class="trow"><span>Вывод:</span><b id="tk-a"></b></div>
-    <div class="trow"><span>Номер:</span><b id="tk-n"></b></div>
-    <p style="color:var(--mut);font-size:13px;font-weight:600;margin:14px 0 16px">Билет сохранён в профиле, в разделе «Выводы». Ожидайте выплату.</p>
-    <button class="btn" onclick="tk(0)">Понятно</button>
+    <button class="btn" id="wbtn" onclick="doWd()">Вывести</button>
   </div>
 </div>
 
@@ -415,7 +401,7 @@ if (uname) applyUser(); else $('login').classList.add('on');
 
 const API_BASE = '';   // адрес вашего сервера, например 'https://my-game.onrender.com' (пусто = тот же сайт)
 async function api(path, body) {
-  const r = await fetch(API_BASE + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dev: uid, user: uname, ...body }) });
+  const r = await fetch(API_BASE + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dev: uid, user: uname, init: (window.Telegram && Telegram.WebApp && Telegram.WebApp.initData) || '', ...body }) });
   const d = await r.json().catch(() => null);
   if (!d) throw new Error('Сервер не подключён');
   if (!r.ok) throw new Error(d.error || 'Ошибка сервера');
@@ -435,7 +421,7 @@ setInterval(claimDeposits, 5000);
 let fastPoll = null;
 function pollDeposit() {   // после оплаты проверяем баланс каждые 0.6 с, пока не придут звёзды
   const b0 = bal; let n = 0; clearInterval(fastPoll);
-  fastPoll = setInterval(async () => { n++; await claimDeposits(); if (bal > b0 || n > 100) clearInterval(fastPoll); }, 600);
+  fastPoll = setInterval(async () => { n++; await claimDeposits(); if (bal > b0 || n > 250) clearInterval(fastPoll); }, 600);
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) claimDeposits(); });
 
@@ -484,14 +470,9 @@ const tkNum = id => '#' + String(id).padStart(4, '0');
 const adminCode = () => localStorage.getItem('admin_code') || '';
 const isAdmin = () => !!adminCode();
 let myTk = [], admTk = [], admTimer;
-function tk(o) { $('tm').classList.toggle('on', !!o); }
-function showTicket(t) {
-  $('tk-u').textContent = '@' + t.user; $('tk-a').textContent = fmt(t.amount) + ' ★' + (t.gift ? ' (подарок)' : '');
-  $('tk-n').textContent = tkNum(t.id); tk(1);
-}
-const tkInfo = t => `<div class="i"><b>${tkNum(t.id)}</b><br>@${esc(t.user)} · ${fmt(t.amount)} ★${t.gift ? ' (подарок)' : ''}</div>`;
+const tkInfo = t => `<div class="i"><b>${tkNum(t.id)}</b><br>${fmt(t.amount)} ★</div>`;
 function drawWd() {
-  $('wd-list').innerHTML = myTk.length ? [...myTk].reverse().map(t => `<div class="tk">${tkInfo(t)}<div class="st ${t.status == 'closed' ? 'ok' : ''}">${t.status == 'closed' ? 'Выплачено' : 'Ожидает'}</div></div>`).join('') : '<div class="inv-empty">Выводов пока нет</div>';
+  $('wd-list').innerHTML = myTk.length ? [...myTk].reverse().map(t => `<div class="tk">${tkInfo(t)}<div class="st ${t.status == 'closed' ? 'ok' : ''}">${t.status == 'closed' ? 'Выплачено' : 'В обработке'}</div></div>`).join('') : '<div class="inv-empty">Выводов пока нет</div>';
   $('admin-box').style.display = isAdmin() ? 'block' : 'none';
   $('adm-list').innerHTML = admTk.length ? admTk.map(t => `<div class="tk">${tkInfo(t)}${t.status == 'closed' ? '<div class="st ok">Закрыт</div>' : `<button class="btn" onclick="closeTicket(${t.id})">Закрыть</button>`}</div>`).join('') : '<div class="inv-empty">Заявок не найдено</div>';
 }
@@ -588,49 +569,22 @@ async function doDep() {
   } catch (e) { toast(e.message === 'Failed to fetch' ? 'Сервер недоступен' : e.message); }
 }
 
-/* ---------- Вывод (заявка, выплата вручную) ---------- */
-let wdBusy = false, wdM = 0, wdGift = null, giftList = null;
+/* ---------- Вывод: звёзды сразу на аккаунт StaticGram того, кто нажал ---------- */
+let wdBusy = false;
 function wd(o) {
   $('wm').classList.toggle('on', !!o);
-  if (o) { $('wam').value = ''; $('wun').value = localStorage.getItem('wd_user') || uname; wdMode(0); }
-}
-async function wdMode(m) {
-  wdM = m; wdGift = null;
-  $('wm-s').classList.toggle('on', !m); $('wm-g').classList.toggle('on', !!m);
-  $('wgifts').style.display = m ? 'flex' : 'none';
-  $('wam').disabled = !!m; $('wam').value = '';
-  $('wam').placeholder = m ? 'Выберите подарок' : 'Сумма от 100 ★';
-  if (m && !giftList) {
-    try { giftList = (await api('/api/gifts')).gifts; }
-    catch (e) { return toast(e.message === 'Failed to fetch' ? 'Сервер недоступен' : e.message); }
-  }
-  if (m) {
-    $('wgifts').innerHTML = giftList.length ? giftList.map((g, i) => `<button class="chip" onclick="pickGift(${i})">${fmt(g.price)} ★</button>`).join('') : '<span style="color:var(--mut);font-size:13px">Подарков пока нет</span>';
-  }
-}
-function pickGift(i) {
-  wdGift = giftList[i]; $('wam').value = wdGift.price;
-  document.querySelectorAll('#wgifts .chip').forEach((b, k) => b.classList.toggle('on', k == i));
+  if (o) $('wam').value = '';
 }
 async function doWd() {
   if (wdBusy) return;
-  const un = $('wun').value.trim().replace(/^@/, '');
-  if (!/^[A-Za-z0-9_]{3,32}$/.test(un)) return toast('Укажите свой @username');
-  let body = { username: un };
-  if (wdM) {
-    if (!wdGift) return toast('Выберите подарок');
-    body.gift_id = wdGift.id; body.amount = wdGift.price;
-  } else {
-    const v = Math.floor(+$('wam').value);
-    if (!(v >= 100)) return toast('Минимум 100 ★');
-    body.amount = v;
-  }
-  if (body.amount > bal) return toast('Недостаточно звёзд');
+  const v = Math.floor(+$('wam').value);
+  if (!(v >= 100)) return toast('Минимум 100 ★');
+  if (v > bal) return toast('Недостаточно звёзд');
   wdBusy = true; $('wbtn').disabled = true;
   try {
-    window.__wd = await api('/api/ticket', body); const t = window.__wd.ticket;
-    bal = (await Promise.resolve(window.__wd)).balance; ui(); localStorage.setItem('wd_user', un); wd(0); showTicket(t); loadWd();
-  } catch (e) { toast(e.message === 'Failed to fetch' ? 'Сервер недоступен' : e.message); }
+    const d = await api('/api/ticket', { amount: v });
+    bal = d.balance; ui(); wd(0); win('Выведено ' + fmt(v) + ' ★ на ваш аккаунт'); loadWd();
+  } catch (e) { toast(errMsg(e)); }
   wdBusy = false; $('wbtn').disabled = false;
 }
 

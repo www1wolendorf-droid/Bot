@@ -1,5 +1,6 @@
 import http from "node:http";
 import fs from "node:fs";
+import crypto from "node:crypto";
 import pg from "pg";
 
 const ADMIN = (process.env.ADMIN_CODE || "Admin-01").toLowerCase();
@@ -22,6 +23,23 @@ const err = (m, s = 400) => json({ error: m }, s);
 const tg = (m, body) =>
   fetch(`${API_URL}/bot${TOKEN}/${m}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(8000) })
     .then((r) => r.json()).catch(() => ({}));
+// Проверка подписи initData из Mini App: возвращает аккаунт StaticGram, который открыл игру
+function tgUser(init) {
+  try {
+    const p = new URLSearchParams(String(init || ""));
+    const hash = p.get("hash");
+    if (!hash || !TOKEN) return null;
+    p.delete("hash");
+    const check = [...p.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([k, v]) => `${k}=${v}`).join("\n");
+    const secret = crypto.createHmac("sha256", "WebAppData").update(TOKEN).digest();
+    const exp = crypto.createHmac("sha256", secret).update(check).digest("hex");
+    if (exp.length !== hash.length || !crypto.timingSafeEqual(Buffer.from(exp), Buffer.from(hash))) return null;
+    if (Date.now() / 1000 - Number(p.get("auth_date")) > 86400) return null;
+    const u = JSON.parse(p.get("user"));
+    return u && u.id ? u : null;
+  } catch { return null; }
+}
+
 const mnMult = (n, k) => { let m = 0.97; for (let i = 0; i < k; i++) m *= (25 - i) / (25 - n - i); return +m.toFixed(2); };
 const crashMult = (t0) => Math.exp((0.12 * (Date.now() - t0)) / 1000);
 const nextCP = () => Math.max(1, Math.floor((100 * 0.96) / (1 - Math.random())) / 100);
@@ -29,6 +47,8 @@ const nextCP = () => Math.max(1, Math.floor((100 * 0.96) / (1 - Math.random())) 
 async function init() {
   await pool.query(`CREATE TABLE IF NOT EXISTS users (key text PRIMARY KEY, data jsonb NOT NULL)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS payments (id text PRIMARY KEY)`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS deposits (nonce text PRIMARY KEY, key text NOT NULL, amount bigint NOT NULL, status text NOT NULL DEFAULT 'pending', created bigint NOT NULL, paid_at bigint)`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS kv (k text PRIMARY KEY, v text NOT NULL)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS tickets (id serial PRIMARY KEY, data jsonb NOT NULL)`);
 }
 
@@ -47,30 +67,76 @@ async function tx(fn) {
 
 const tkRow = (r) => ({ id: r.id, ...r.data });
 
-// ---------- вебхук бота: оплата статиками ----------
+// ---------- зачисление пополнения (одно место для вебхука и сверки) ----------
+// Каждый счёт имеет свой одноразовый номер (nonce) в payload: "dep2:<nonce>". Зачислить его можно только один раз.
+async function creditDeposit(payload, amount, chargeId) {
+  amount = Math.floor(+amount);
+  if (!(amount > 0)) return null;
+  const isNew = payload.startsWith("dep2:");
+  const ref = payload.slice(isNew ? 5 : 4);
+  return tx(async (c) => {
+    let key;
+    if (isNew) {
+      const d = await c.query("UPDATE deposits SET status='paid', paid_at=$2 WHERE nonce=$1 AND status='pending' RETURNING key", [ref, Date.now()]);
+      if (!d.rowCount) return null; // неизвестный номер или уже зачислено
+      key = d.rows[0].key;
+    } else { // старый формат dep:<username>, защита от повторов по номеру платежа
+      if (!chargeId) return null;
+      const ins = await c.query("INSERT INTO payments(id) VALUES($1) ON CONFLICT DO NOTHING RETURNING id", [chargeId]);
+      if (!ins.rowCount) return null;
+      key = "u:" + ref.toLowerCase();
+    }
+    const r = await c.query("SELECT data FROM users WHERE key=$1 FOR UPDATE", [key]);
+    if (!r.rowCount) return null;
+    const u = r.rows[0].data;
+    u.balance = (u.balance || 0) + amount;
+    await c.query("UPDATE users SET data=$2 WHERE key=$1", [key, u]);
+    return { key, amount };
+  });
+}
+
+// Сверка с историей платежей бота: подхватывает пополнения, если вебхук опоздал или потерялся
+let recBusy = false, recAt = 0;
+async function reconcile() {
+  if (!TOKEN || recBusy || Date.now() - recAt < 2500) return;
+  recBusy = true; recAt = Date.now();
+  try {
+    const pend = await pool.query("SELECT min(created) AS m FROM deposits WHERE status='pending' AND created > $1", [Date.now() - 6 * 36e5]);
+    if (!pend.rows[0].m) return;
+    const cutoff = Math.floor(Number(pend.rows[0].m) / 1000) - 600;
+    const kv = await pool.query("SELECT v FROM kv WHERE k='tx_offset'");
+    const LIM = 100;
+    let off = Number(kv.rows[0]?.v || 0), ascending = null;
+    for (let page = 0; page < 30; page++) {
+      const d = await tg("getStarTransactions", { offset: off, limit: LIM });
+      const list = d?.result?.transactions;
+      if (!Array.isArray(list)) break;
+      if (ascending === null && list.length >= 2) ascending = list[0].date <= list[list.length - 1].date;
+      for (const x of list) {
+        const p = x?.source?.invoice_payload;
+        if (typeof p === "string" && p.startsWith("dep2:") && x.amount > 0) { const r = await creditDeposit(p, x.amount); if (r) console.log("reconcile credited", r.amount); }
+      }
+      off += list.length;
+      if (list.length < LIM) break;
+      if (ascending === false && list[list.length - 1].date < cutoff) break; // история идёт от новых к старым
+    }
+    if (ascending) await pool.query("INSERT INTO kv(k,v) VALUES('tx_offset',$1) ON CONFLICT (k) DO UPDATE SET v=EXCLUDED.v", [String(off)]);
+  } catch (e) { console.error("reconcile error", e.message); }
+  finally { recBusy = false; }
+}
+
+// ---------- вебхук бота: оплата статиками (отвечаем сразу, тяжёлое делаем после ответа) ----------
+const answerPre = async (id) => { for (let i = 0; i < 3; i++) { const r = await tg("answerPreCheckoutQuery", { pre_checkout_query_id: id, ok: true }); if (r.ok) return; } console.error("answerPreCheckoutQuery failed", id); };
 async function hook(headers, b) {
   if (SECRET && headers["x-telegram-bot-api-secret-token"] !== SECRET) return err("forbidden", 403);
-  if (b.pre_checkout_query) {
-    await tg("answerPreCheckoutQuery", { pre_checkout_query_id: b.pre_checkout_query.id, ok: true });
-    return json({ ok: true });
-  }
+  console.log("webhook", new Date().toISOString(), Object.keys(b).join(","));
+  if (b.pre_checkout_query) { answerPre(b.pre_checkout_query.id); return json({ ok: true }); }
   const m = b.message, sp = m?.successful_payment;
-  if (sp && sp.currency === "XTR" && String(sp.invoice_payload).startsWith("dep:")) {
-    const cid = sp.telegram_payment_charge_id;
-    const key = "u:" + String(sp.invoice_payload).slice(4).toLowerCase();
-    const credited = await tx(async (c) => {
-      const ins = await c.query("INSERT INTO payments(id) VALUES($1) ON CONFLICT DO NOTHING RETURNING id", [cid]);
-      if (!ins.rowCount) return false; // уже зачислено
-      const r = await c.query("SELECT data FROM users WHERE key=$1 FOR UPDATE", [key]);
-      if (!r.rowCount) return false;
-      const u = r.rows[0].data;
-      u.balance = (u.balance || 0) + sp.total_amount;
-      await c.query("UPDATE users SET data=$2 WHERE key=$1", [key, u]);
-      return true;
-    });
-    if (credited) tg("sendMessage", { chat_id: m.chat.id, text: `Зачислено ${sp.total_amount} ★. Вернитесь в игру.` });
+  if (sp && sp.currency === "XTR" && String(sp.invoice_payload).startsWith("dep")) {
+    const res = await creditDeposit(String(sp.invoice_payload), sp.total_amount, sp.telegram_payment_charge_id);
+    if (res) tg("sendMessage", { chat_id: m.chat.id, text: `Зачислено ${res.amount} ★. Вернитесь в игру.` });
   } else if (m?.text?.startsWith("/start")) {
-    await tg("sendMessage", { chat_id: m.chat.id, text: "Murder Game. Пополнение делается в игре кнопкой «+»." });
+    tg("sendMessage", { chat_id: m.chat.id, text: "Murder Game. Пополнение делается в игре кнопкой «+»." });
   }
   return json({ ok: true });
 }
@@ -87,7 +153,7 @@ function payoutError(d) {
 
 // мгновенный вывод: withdrawStarBalance отправляет звёзды из банка бота на баланс игрока в StaticGram
 async function autoPayout(key, t) {
-  const call = () => tg("withdrawStarBalance", { user_id: "@" + t.user, star_count: t.amount, request_id: "w" + t.id });
+  const call = () => tg("withdrawStarBalance", { user_id: Number(t.uid), star_count: t.amount, request_id: "w" + t.id });
   let d = await call();
   for (let i = 0; i < 2 && !d.ok && !d.error_code; i++) d = await call(); // нет ответа: повтор с тем же request_id безопасен
   if (d.ok) {
@@ -115,13 +181,6 @@ async function autoPayout(key, t) {
 
 async function route(path, b, headers) {
   if (path === "tg") return hook(headers, b);
-
-  // ---------- подарки для вывода ----------
-  if (path === "gifts") {
-    const d = await tg("getAvailableGifts", {});
-    const list = (d?.result?.gifts || []).map((g) => ({ id: g.id, price: g.star_count })).filter((g) => g.id && g.price > 0).sort((a, c) => a.price - c.price);
-    return json({ gifts: list });
-  }
 
   // ---------- админ ----------
   if (path === "admin" || path === "admin_close") {
@@ -159,7 +218,7 @@ async function route(path, b, headers) {
     const NOFUNDS = "Недостаточно звёзд (мин. ставка 10 ★)";
 
     const res = await (async () => {
-      if (path === "register" || path === "me") return out({ daily: u.daily });
+      if (path === "register" || path === "me") { if (path === "me") reconcile(); return out({ daily: u.daily }); }
 
       if (path === "top") {
         const f = b.by === "won" ? "won" : "turnover";
@@ -186,7 +245,9 @@ async function route(path, b, headers) {
         const amount = Math.floor(+b.amount);
         if (!(amount >= 15 && amount <= 50000)) return err("Сумма от 15 до 50 000 ★");
         if (!TOKEN) return err("Бот не настроен", 500);
-        const d = await tg("createInvoiceLink", { title: "Пополнение", description: `Пополнение баланса на ${amount} ★`, payload: "dep:" + u.name, currency: "XTR", prices: [{ label: "Звёзды", amount }] });
+        const nonce = crypto.randomBytes(9).toString("hex");
+        await pool.query("INSERT INTO deposits(nonce, key, amount, created) VALUES($1,$2,$3,$4)", [nonce, key, amount, Date.now()]); // сразу, до создания счёта
+        const d = await tg("createInvoiceLink", { title: "Пополнение", description: `Пополнение баланса на ${amount} ★`, payload: "dep2:" + nonce, currency: "XTR", prices: [{ label: "Звёзды", amount }] });
         if (!d.ok) { console.error("createInvoiceLink failed", JSON.stringify(d)); return err("Не удалось создать счёт", 502); }
         return json({ link: d.result });
       }
@@ -249,19 +310,18 @@ async function route(path, b, headers) {
 
       // ---------- вывод ----------
       if (path === "ticket") {
-        const amount = Math.floor(+b.amount), payoutName = String(b.username || u.name).replace(/^@/, "");
+        const amount = Math.floor(+b.amount);
         if (!(amount >= 100 && amount <= 1e7)) return err("Минимум 100 ★");
-        if (!/^[A-Za-z0-9_]{3,32}$/.test(payoutName)) return err("Укажите свой @username");
+        const tu = tgUser(b.init);
+        if (!tu) return err("Откройте игру внутри StaticGram, чтобы вывести звёзды");
         if (amount > u.balance) return err("Недостаточно звёзд");
-        const usedR = await c.query("SELECT coalesce(sum((data->>'amount')::numeric),0)::bigint AS s FROM tickets WHERE lower(coalesce(data->>'owner', data->>'user')) = $1 AND (data->>'ts')::numeric > $2 AND data->>'status' <> 'failed'", [name.toLowerCase(), Date.now() - 864e5]);
+        const usedR = await c.query("SELECT coalesce(sum((data->>'amount')::numeric),0)::bigint AS s FROM tickets WHERE (lower(coalesce(data->>'owner', data->>'user')) = $1 OR data->>'uid' = $3) AND (data->>'ts')::numeric > $2 AND data->>'status' <> 'failed'", [name.toLowerCase(), Date.now() - 864e5, String(tu.id)]);
         const left = Math.max(0, WITHDRAW_LIMIT - Number(usedR.rows[0].s));
         if (amount > left) return err(left > 0 ? `Лимит вывода ${spaced(WITHDRAW_LIMIT)} ★ в сутки. Сейчас можно вывести ещё ${spaced(left)} ★` : `Лимит вывода ${spaced(WITHDRAW_LIMIT)} ★ в сутки исчерпан. Попробуйте позже`);
         u.balance -= amount; save();
-        const auto = !b.gift_id; // звёзды выплачиваются сразу, подарки пока вручную
-        const data = { user: payoutName, owner: u.name, amount, gift: !!b.gift_id, status: auto ? "processing" : "open", ts: Date.now() };
+        const data = { user: tu.username || String(tu.id), uid: String(tu.id), owner: u.name, amount, gift: false, status: "processing", ts: Date.now() };
         const ins = await c.query("INSERT INTO tickets(data) VALUES($1) RETURNING id", [data]);
         const ticket = { id: ins.rows[0].id, ...data };
-        if (!auto) return out({ ticket });
         return { ...out({ ticket }), after: () => autoPayout(key, ticket) };
       }
       if (path === "my_tickets") {
