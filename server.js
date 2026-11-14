@@ -8,6 +8,8 @@ const SECRET = process.env.TG_SECRET || "";
 const API_URL = (process.env.API_URL || "https://api.staticgram.top").replace(/\/$/, "");
 const PUBLIC_URL = process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || "";
 const PORT = process.env.PORT || 10000;
+const WITHDRAW_LIMIT = +process.env.WITHDRAW_DAILY_LIMIT || 35000; // макс. вывод одного игрока за 24 часа, ★
+const spaced = (n) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, " ");
 const PROMOS = { MURDER: 500, TGSTARS: 250, PLUMB: 1000 };
 const UP = [[1.5, 60], [2, 45], [3, 25], [5, 15], [10, 9], [50, 1.6], [100, 0.9]];
 
@@ -66,11 +68,49 @@ async function hook(headers, b) {
       await c.query("UPDATE users SET data=$2 WHERE key=$1", [key, u]);
       return true;
     });
-    if (credited) await tg("sendMessage", { chat_id: m.chat.id, text: `Зачислено ${sp.total_amount} ★. Вернитесь в игру.` });
+    if (credited) tg("sendMessage", { chat_id: m.chat.id, text: `Зачислено ${sp.total_amount} ★. Вернитесь в игру.` });
   } else if (m?.text?.startsWith("/start")) {
     await tg("sendMessage", { chat_id: m.chat.id, text: "Murder Game. Пополнение делается в игре кнопкой «+»." });
   }
   return json({ ok: true });
+}
+
+function payoutError(d) {
+  const s = String(d?.description || "");
+  if (/BALANCE_TOO_LOW/.test(s)) return "В банке игры сейчас не хватает звёзд для выплаты. Попробуйте позже. Баланс возвращён";
+  if (/user not found|USER_ID_INVALID/i.test(s)) return "Пользователь с таким юзернеймом не найден в StaticGram. Проверьте @username. Баланс возвращён";
+  if (/USER_IS_BOT|USER_FROZEN/.test(s)) return "Этому аккаунту нельзя отправить звёзды. Баланс возвращён";
+  if (/STAR_WITHDRAWAL_DISABLED/.test(s)) return "Вывод сейчас отключён. Баланс возвращён";
+  if (/Too Many Requests/i.test(s) || d?.error_code === 429) return "Слишком много выводов сразу. Повторите через несколько секунд. Баланс возвращён";
+  return "Не удалось отправить звёзды. Баланс возвращён";
+}
+
+// мгновенный вывод: withdrawStarBalance отправляет звёзды из банка бота на баланс игрока в StaticGram
+async function autoPayout(key, t) {
+  const call = () => tg("withdrawStarBalance", { user_id: "@" + t.user, star_count: t.amount, request_id: "w" + t.id });
+  let d = await call();
+  for (let i = 0; i < 2 && !d.ok && !d.error_code; i++) d = await call(); // нет ответа: повтор с тем же request_id безопасен
+  if (d.ok) {
+    const bal = await tx(async (c) => {
+      await c.query(`UPDATE tickets SET data = jsonb_set(data, '{status}', '"closed"') WHERE id=$1`, [t.id]);
+      const r = await c.query("SELECT data->>'balance' AS b FROM users WHERE key=$1", [key]);
+      return Number(r.rows[0]?.b || 0);
+    });
+    return json({ balance: bal, ticket: { ...t, status: "closed" } });
+  }
+  if (!d.error_code) { // ответа так и не было: не возвращаем баланс вслепую, заявка остаётся на ручную проверку
+    console.error("withdrawStarBalance no response, ticket", t.id);
+    return err("Выплата обрабатывается. Если звёзды не придут в ближайшее время, обратитесь к администратору", 502);
+  }
+  console.error("withdrawStarBalance failed, ticket", t.id, JSON.stringify(d));
+  await tx(async (c) => {
+    const upd = await c.query(`UPDATE tickets SET data = jsonb_set(data, '{status}', '"failed"') WHERE id=$1 AND data->>'status'='processing' RETURNING id`, [t.id]);
+    if (!upd.rowCount) return;
+    const r = await c.query("SELECT data FROM users WHERE key=$1 FOR UPDATE", [key]);
+    const u = r.rows[0].data; u.balance += t.amount;
+    await c.query("UPDATE users SET data=$2 WHERE key=$1", [key, u]);
+  });
+  return err(payoutError(d), 502);
 }
 
 async function route(path, b, headers) {
@@ -90,7 +130,7 @@ async function route(path, b, headers) {
       const q = String(b.q || "").trim().replace(/^@/, "").toLowerCase();
       const r = q
         ? await pool.query("SELECT id, data FROM tickets WHERE position($1 in lower(data->>'user')) > 0 OR position($1 in lower(coalesce(data->>'owner',''))) > 0 ORDER BY id DESC LIMIT 100", [q])
-        : await pool.query("SELECT id, data FROM tickets WHERE data->>'status'='open' ORDER BY id DESC LIMIT 100");
+        : await pool.query("SELECT id, data FROM tickets WHERE data->>'status' IN ('open','processing') ORDER BY id DESC LIMIT 100");
       return json({ tickets: r.rows.map(tkRow) });
     }
     const r = await pool.query(`UPDATE tickets SET data = jsonb_set(data, '{status}', '"closed"') WHERE id=$1 RETURNING id`, [Math.floor(+b.id) || 0]);
@@ -104,7 +144,7 @@ async function route(path, b, headers) {
   if (!/^[a-f0-9]{32}$/.test(dev)) return err("Неверное устройство");
   const key = "u:" + name.toLowerCase();
 
-  return tx(async (c) => {
+  const done = await tx(async (c) => {
     const fresh = { name, dev, ts: Date.now(), v: 2, balance: 0, turnover: 0, won: 0, games: 0, promos: [], daily: 0 };
     await c.query("INSERT INTO users(key, data) VALUES($1,$2) ON CONFLICT DO NOTHING", [key, fresh]);
     const r = await c.query("SELECT data FROM users WHERE key=$1 FOR UPDATE", [key]);
@@ -213,13 +253,19 @@ async function route(path, b, headers) {
         if (!(amount >= 100 && amount <= 1e7)) return err("Минимум 100 ★");
         if (!/^[A-Za-z0-9_]{3,32}$/.test(payoutName)) return err("Укажите свой @username");
         if (amount > u.balance) return err("Недостаточно звёзд");
+        const usedR = await c.query("SELECT coalesce(sum((data->>'amount')::numeric),0)::bigint AS s FROM tickets WHERE lower(coalesce(data->>'owner', data->>'user')) = $1 AND (data->>'ts')::numeric > $2 AND data->>'status' <> 'failed'", [name.toLowerCase(), Date.now() - 864e5]);
+        const left = Math.max(0, WITHDRAW_LIMIT - Number(usedR.rows[0].s));
+        if (amount > left) return err(left > 0 ? `Лимит вывода ${spaced(WITHDRAW_LIMIT)} ★ в сутки. Сейчас можно вывести ещё ${spaced(left)} ★` : `Лимит вывода ${spaced(WITHDRAW_LIMIT)} ★ в сутки исчерпан. Попробуйте позже`);
         u.balance -= amount; save();
-        const data = { user: payoutName, owner: u.name, amount, gift: !!b.gift_id, status: "open", ts: Date.now() };
+        const auto = !b.gift_id; // звёзды выплачиваются сразу, подарки пока вручную
+        const data = { user: payoutName, owner: u.name, amount, gift: !!b.gift_id, status: auto ? "processing" : "open", ts: Date.now() };
         const ins = await c.query("INSERT INTO tickets(data) VALUES($1) RETURNING id", [data]);
-        return out({ ticket: { id: ins.rows[0].id, ...data } });
+        const ticket = { id: ins.rows[0].id, ...data };
+        if (!auto) return out({ ticket });
+        return { ...out({ ticket }), after: () => autoPayout(key, ticket) };
       }
       if (path === "my_tickets") {
-        const r2 = await c.query("SELECT id, data FROM tickets WHERE lower(coalesce(data->>'owner', data->>'user')) = $1 ORDER BY id", [name.toLowerCase()]);
+        const r2 = await c.query("SELECT id, data FROM tickets WHERE lower(coalesce(data->>'owner', data->>'user')) = $1 AND data->>'status' <> 'failed' ORDER BY id", [name.toLowerCase()]);
         return json({ tickets: r2.rows.map(tkRow) });
       }
 
@@ -229,6 +275,7 @@ async function route(path, b, headers) {
     if (dirty) await c.query("UPDATE users SET data=$2 WHERE key=$1", [key, u]);
     return res;
   });
+  return done.after ? done.after() : done;
 }
 
 const html = fs.readFileSync(new URL("./index.html", import.meta.url));
